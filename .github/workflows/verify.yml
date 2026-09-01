@@ -16,7 +16,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
       - run: pnpm install --no-frozen-lockfile
       - run: pnpm lint
       - run: pnpm typecheck
@@ -25,3 +24,9 @@ jobs:
         env:
           TURSO_DATABASE_URL: https://example.invalid
           TURSO_AUTH_TOKEN: ci-placeholder
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pnpm-lock
+          path: pnpm-lock.yaml
+          if-no-files-found: ignore
