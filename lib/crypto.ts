@@ -41,8 +41,10 @@ export async function hashVerifier(verifier: string) {
 
 async function deriveVaultKeyWithIterations(password: string, salt: Uint8Array, iterations: number) {
   const base = await passwordMaterial(password, ["deriveKey"]);
+  const saltBuffer = new ArrayBuffer(salt.byteLength);
+  new Uint8Array(saltBuffer).set(salt);
   return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
+    { name: "PBKDF2", salt: saltBuffer, iterations, hash: "SHA-256" },
     base,
     { name: "AES-GCM", length: 256 },
     false,
