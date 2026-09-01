@@ -60,7 +60,7 @@ test("Ruleset은 effectiveFrom 기준으로 과거 기록에 소급되지 않는
 test("CSV v2 round trip은 데이터와 Ruleset 이력을 보존한다", () => {
   const data = defaultData();
   data.rulesets.push({ ...data.rulesets[0], id: "future", effectiveFrom: "2026-10-01", lunchBudget: 12_000, updatedAt: 99 });
-  data.entries["2026-09-01"] = { date: "2026-09-01", lunch: 8_500, dinner: 12_000, dinnerEligible: true, updatedAt: 100 };
+  data.entries["2026-09-01"] = { date: "2026-09-01", lunch: 8_500, dinner: 12_000, dinnerEligible: true, dayOverride: undefined, updatedAt: 100 };
   assert.deepEqual(parseCsv(serializeCsv(data)), data);
 });
 
