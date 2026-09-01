@@ -10,8 +10,9 @@ async function pbkdf2(password: string, salt: Uint8Array, usage: KeyUsage[]) {
 }
 
 export async function authVerifier(username: string, password: string) {
-  const input = enc.encode(`food-coster-auth\n${username.trim().toLowerCase()}\n${password}`);
-  return hex(await crypto.subtle.digest("SHA-256", input));
+  const base = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const salt = enc.encode(`food-coster-auth:${username.trim().toLowerCase()}`);
+  return hex(await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: 210000, hash: "SHA-256" }, base, 256));
 }
 
 export async function hashVerifier(verifier: string) {
