@@ -154,24 +154,57 @@ export function dinnerEligible(date: Date, data: AppData) {
 
 export function periodSummary(data: AppData, target = new Date()) {
   const { start, end } = cycleRange(target, data.rules.cycleDay);
-  let total = 0, used = 0, accrued = 0;
+  const today = dateKey(target);
+  const todayEnd = new Date(target.getFullYear(), target.getMonth(), target.getDate(), 23, 59, 59, 999);
+  let total = 0;
+  let used = 0;
+  let lunchAccrued = 0;
+  let dinnerAccrued = 0;
+  let lunchCarrySpent = 0;
+  let dinnerCarrySpent = 0;
+  let todayLunchAvailable = 0;
+  let todayDinnerAvailable = 0;
+
   const cursor = new Date(start);
-  const todayEnd = new Date(target.getFullYear(), target.getMonth(), target.getDate(), 23,59,59,999);
   while (cursor <= end) {
     const key = dateKey(cursor);
     const entry = data.entries[key];
-    const work = isWorkday(cursor, data.rules, entry);
-    const lunchAllowance = work ? data.rules.lunchBudget : 0;
+    const lunchAllowance = isWorkday(cursor, data.rules, entry) ? data.rules.lunchBudget : 0;
     const dinnerAllowance = dinnerEligible(cursor, data) ? data.rules.dinnerBudget : 0;
+    const lunchSpent = entry?.lunch ?? 0;
+    const dinnerSpent = entry?.dinner ?? 0;
+
     total += lunchAllowance + dinnerAllowance;
-    used += (entry?.lunch ?? 0) + (entry?.dinner ?? 0);
+    used += lunchSpent + dinnerSpent;
+
     if (cursor <= todayEnd) {
-      const lunchNow = data.rules.lunchCarry === "CARRY" ? lunchAllowance : (dateKey(cursor) === dateKey(target) ? lunchAllowance : Math.min(entry?.lunch ?? 0, lunchAllowance));
-      const dinnerNow = data.rules.dinnerCarry === "CARRY" ? dinnerAllowance : (dateKey(cursor) === dateKey(target) ? dinnerAllowance : Math.min(entry?.dinner ?? 0, dinnerAllowance));
-      accrued += lunchNow + dinnerNow;
+      if (data.rules.lunchCarry === "CARRY") {
+        lunchAccrued += lunchAllowance;
+        lunchCarrySpent += lunchSpent;
+      } else if (key === today) {
+        todayLunchAvailable = Math.max(0, lunchAllowance - lunchSpent);
+      }
+
+      if (data.rules.dinnerCarry === "CARRY") {
+        dinnerAccrued += dinnerAllowance;
+        dinnerCarrySpent += dinnerSpent;
+      } else if (key === today) {
+        todayDinnerAvailable = Math.max(0, dinnerAllowance - dinnerSpent);
+      }
     }
+
     cursor.setDate(cursor.getDate()+1);
   }
-  const usedToDate = Object.values(data.entries).filter(e => { const d = fromDateKey(e.date); return d >= start && d <= todayEnd; }).reduce((sum,e) => sum + e.lunch + e.dinner, 0);
-  return { start, end, total, used, remaining: Math.max(0, total-used), availableNow: Math.max(0, accrued-usedToDate) };
+
+  const lunchAvailable = data.rules.lunchCarry === "CARRY" ? Math.max(0, lunchAccrued - lunchCarrySpent) : todayLunchAvailable;
+  const dinnerAvailable = data.rules.dinnerCarry === "CARRY" ? Math.max(0, dinnerAccrued - dinnerCarrySpent) : todayDinnerAvailable;
+
+  return {
+    start,
+    end,
+    total,
+    used,
+    remaining: Math.max(0, total-used),
+    availableNow: lunchAvailable + dinnerAvailable,
+  };
 }
