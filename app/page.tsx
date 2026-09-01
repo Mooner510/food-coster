@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import {
   authVerifier,
+  decryptCsvWithKey,
   deriveVaultKey,
   encryptCsvWithKey,
   hashVerifier,
@@ -34,7 +35,6 @@ import {
   defaultData,
   dinnerEligible,
   fromDateKey,
-  isWorkday,
   mealAllowance,
   nextCycleStart,
   parseCsv,
@@ -58,8 +58,18 @@ type Session = {
   salt: string;
   serverRevision: number;
 };
-type ApiResult = { error?: string; vault?: string; revision?: number; updatedAt?: number; conflict?: boolean; deleted?: boolean };
-type InstallPromptEvent = Event & { prompt: () => Promise<void>; userChoice: Promise<{ outcome: "accepted" | "dismissed" }> };
+type ApiResult = {
+  error?: string;
+  vault?: string;
+  revision?: number;
+  updatedAt?: number;
+  conflict?: boolean;
+  deleted?: boolean;
+};
+type InstallPromptEvent = Event & {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
+};
 
 const money = (value: number) => `${Math.max(0, Math.round(value)).toLocaleString("ko-KR")}원`;
 const normalizeUser = (value: string) => value.trim().toLowerCase();
@@ -83,6 +93,7 @@ export default function Page() {
   const [syncState, setSyncState] = useState<SyncState>("saved");
   const [today, setToday] = useState(nowKey());
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
+
   const sessionRef = useRef<Session | null>(null);
   const dataRef = useRef(data);
   const pendingSync = useRef(false);
@@ -95,14 +106,20 @@ export default function Page() {
 
   useEffect(() => {
     if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).catch(() => undefined);
-    const install = (event: Event) => { event.preventDefault(); setInstallPrompt(event as InstallPromptEvent); };
-    window.addEventListener("beforeinstallprompt", install);
+    const onInstallPrompt = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event as InstallPromptEvent);
+    };
+    window.addEventListener("beforeinstallprompt", onInstallPrompt);
     const timer = window.setInterval(() => setToday(nowKey()), 30_000);
-    return () => { window.removeEventListener("beforeinstallprompt", install); window.clearInterval(timer); };
+    return () => {
+      window.removeEventListener("beforeinstallprompt", onInstallPrompt);
+      window.clearInterval(timer);
+    };
   }, []);
 
   const writeLocal = useCallback((snapshot: AppData, current: Session, pending: boolean) => {
-    const modifiedAt = Date.now();
+    const localModifiedAt = Date.now();
     saveChain.current = saveChain.current.then(async () => {
       const vault = await encryptCsvWithKey(serializeCsv(snapshot), current.key, current.salt);
       await saveLocal({
@@ -110,11 +127,17 @@ export default function Page() {
         verifierHash: current.verifierHash,
         vault,
         serverRevision: current.serverRevision,
-        localModifiedAt: modifiedAt,
+        localModifiedAt,
         pendingSync: pending,
       });
     }).catch(() => undefined);
     return saveChain.current;
+  }, []);
+
+  const decryptRemote = useCallback(async (vaultText: string, current: Session) => {
+    const vault = JSON.parse(vaultText) as EncryptedVault;
+    if (vault.salt !== current.salt) throw new Error("다른 기기에서 암호가 변경되었습니다. 다시 로그인해 주세요.");
+    return parseCsv(await decryptCsvWithKey(vault, current.key));
   }, []);
 
   const synchronize = useCallback(async () => {
@@ -123,6 +146,7 @@ export default function Page() {
       if (current && !navigator.onLine) setSyncState("offline");
       return;
     }
+
     syncing.current = true;
     setSyncState("saving");
     try {
@@ -130,20 +154,14 @@ export default function Page() {
         const remote = await api({ action: "pull", username: current.username, verifier: current.verifier });
         const remoteRevision = Math.max(1, Number(remote.revision ?? 1));
         if (remoteRevision > current.serverRevision && remote.vault) {
-          const unlocked = await unlockVault(JSON.parse(remote.vault) as EncryptedVault, "__keyless__").catch(() => null);
-          if (!unlocked) {
-            const remoteVault = JSON.parse(remote.vault) as EncryptedVault;
-            if (remoteVault.salt !== current.salt) throw new Error("다른 기기에서 암호가 변경되었습니다. 다시 로그인해 주세요.");
-            const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: Uint8Array.from(atob(remoteVault.iv), (c) => c.charCodeAt(0)) }, current.key, Uint8Array.from(atob(remoteVault.ciphertext), (c) => c.charCodeAt(0)));
-            const remoteData = parseCsv(new TextDecoder().decode(plain));
-            const merged = mergeAppData(dataRef.current, remoteData);
-            dataRef.current = merged;
-            setData(merged);
-            const next = { ...current, serverRevision: remoteRevision };
-            sessionRef.current = next;
-            setSession(next);
-            await writeLocal(merged, next, false);
-          }
+          const remoteData = await decryptRemote(remote.vault, current);
+          const merged = mergeAppData(dataRef.current, remoteData);
+          dataRef.current = merged;
+          setData(merged);
+          const next = { ...current, serverRevision: remoteRevision };
+          sessionRef.current = next;
+          setSession(next);
+          await writeLocal(merged, next, false);
         }
         setSyncState("saved");
         return;
@@ -151,8 +169,17 @@ export default function Page() {
 
       const vault = await encryptCsvWithKey(serializeCsv(dataRef.current), current.key, current.salt);
       try {
-        const pushed = await api({ action: "push", username: current.username, verifier: current.verifier, vault: JSON.stringify(vault), baseRevision: current.serverRevision });
-        const next = { ...current, serverRevision: Math.max(current.serverRevision + 1, Number(pushed.revision ?? current.serverRevision + 1)) };
+        const pushed = await api({
+          action: "push",
+          username: current.username,
+          verifier: current.verifier,
+          vault: JSON.stringify(vault),
+          baseRevision: current.serverRevision,
+        });
+        const next = {
+          ...current,
+          serverRevision: Math.max(current.serverRevision + 1, Number(pushed.revision ?? current.serverRevision + 1)),
+        };
         sessionRef.current = next;
         setSession(next);
         pendingSync.current = false;
@@ -162,15 +189,20 @@ export default function Page() {
         const payload = (error as Error & { payload?: ApiResult }).payload;
         if (!payload?.conflict || !payload.vault) throw error;
         setSyncState("conflict");
-        const remoteVault = JSON.parse(payload.vault) as EncryptedVault;
-        if (remoteVault.salt !== current.salt) throw new Error("다른 기기에서 암호가 변경되었습니다. 다시 로그인해 주세요.");
-        const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: Uint8Array.from(atob(remoteVault.iv), (c) => c.charCodeAt(0)) }, current.key, Uint8Array.from(atob(remoteVault.ciphertext), (c) => c.charCodeAt(0)));
-        const merged = mergeAppData(dataRef.current, parseCsv(new TextDecoder().decode(plain)));
+
+        const remoteData = await decryptRemote(payload.vault, current);
+        const merged = mergeAppData(dataRef.current, remoteData);
         dataRef.current = merged;
         setData(merged);
         const remoteRevision = Math.max(1, Number(payload.revision ?? 1));
         const mergedVault = await encryptCsvWithKey(serializeCsv(merged), current.key, current.salt);
-        const retry = await api({ action: "push", username: current.username, verifier: current.verifier, vault: JSON.stringify(mergedVault), baseRevision: remoteRevision });
+        const retry = await api({
+          action: "push",
+          username: current.username,
+          verifier: current.verifier,
+          vault: JSON.stringify(mergedVault),
+          baseRevision: remoteRevision,
+        });
         const next = { ...current, serverRevision: Number(retry.revision ?? remoteRevision + 1) };
         sessionRef.current = next;
         setSession(next);
@@ -183,7 +215,7 @@ export default function Page() {
     } finally {
       syncing.current = false;
     }
-  }, [writeLocal]);
+  }, [decryptRemote, writeLocal]);
 
   const scheduleSync = useCallback(() => {
     if (syncTimer.current) clearTimeout(syncTimer.current);
@@ -207,7 +239,10 @@ export default function Page() {
     const visible = () => { if (document.visibilityState === "visible") void synchronize(); };
     window.addEventListener("online", online);
     document.addEventListener("visibilitychange", visible);
-    return () => { window.removeEventListener("online", online); document.removeEventListener("visibilitychange", visible); };
+    return () => {
+      window.removeEventListener("online", online);
+      document.removeEventListener("visibilitychange", visible);
+    };
   }, [synchronize]);
 
   const authenticated = useCallback((nextData: AppData, nextSession: Session, pending: boolean) => {
@@ -241,13 +276,11 @@ export default function Page() {
     URL.revokeObjectURL(url);
   }, []);
 
-  const importBackup = useCallback(async (file: File) => {
-    const current = sessionRef.current;
-    if (!current) return;
+  const importBackup = useCallback(async (file: File, password: string) => {
+    if (password.length < 8) throw new Error("백업 암호를 입력해 주세요.");
     const vault = JSON.parse(await file.text()) as EncryptedVault;
-    if (vault.salt !== current.salt) throw new Error("현재 암호로 만든 백업만 가져올 수 있습니다.");
-    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: Uint8Array.from(atob(vault.iv), (c) => c.charCodeAt(0)) }, current.key, Uint8Array.from(atob(vault.ciphertext), (c) => c.charCodeAt(0)));
-    const restored = parseCsv(new TextDecoder().decode(plain));
+    const unlocked = await unlockVault(vault, password);
+    const restored = parseCsv(unlocked.csv);
     mutate(() => restored);
   }, [mutate]);
 
@@ -258,12 +291,27 @@ export default function Page() {
     if (pendingSync.current) await synchronize();
     const fresh = sessionRef.current;
     if (!fresh || pendingSync.current) throw new Error("동기화 후 다시 시도해 주세요.");
+
     const newVerifier = await authVerifier(fresh.username, password);
     const newVerifierHash = await hashVerifier(newVerifier);
     const { key, salt } = await deriveVaultKey(password);
     const vault = await encryptCsvWithKey(serializeCsv(dataRef.current), key, salt);
-    const result = await api({ action: "change_credentials", username: fresh.username, verifier: fresh.verifier, newVerifier, vault: JSON.stringify(vault), baseRevision: fresh.serverRevision });
-    const next: Session = { username: fresh.username, verifier: newVerifier, verifierHash: newVerifierHash, key, salt, serverRevision: Number(result.revision ?? fresh.serverRevision + 1) };
+    const result = await api({
+      action: "change_credentials",
+      username: fresh.username,
+      verifier: fresh.verifier,
+      newVerifier,
+      vault: JSON.stringify(vault),
+      baseRevision: fresh.serverRevision,
+    });
+    const next: Session = {
+      username: fresh.username,
+      verifier: newVerifier,
+      verifierHash: newVerifierHash,
+      key,
+      salt,
+      serverRevision: Number(result.revision ?? fresh.serverRevision + 1),
+    };
     sessionRef.current = next;
     setSession(next);
     await writeLocal(dataRef.current, next, false);
@@ -297,7 +345,18 @@ export default function Page() {
       <section className="content">
         {view === "home" && <HomeView data={data} today={today} mutate={mutate} />}
         {view === "calendar" && <CalendarView data={data} today={today} mutate={mutate} />}
-        {view === "settings" && <SettingsView data={data} session={session} mutate={mutate} installable={!!installPrompt} onInstall={install} onExport={exportBackup} onImport={importBackup} onChangePassword={changePassword} onDelete={deleteAccount} onLogout={logout} />}
+        {view === "settings" && <SettingsView
+          data={data}
+          session={session}
+          mutate={mutate}
+          installable={!!installPrompt}
+          onInstall={install}
+          onExport={exportBackup}
+          onImport={importBackup}
+          onChangePassword={changePassword}
+          onDelete={deleteAccount}
+          onLogout={logout}
+        />}
       </section>
       <nav className="bottom-nav">
         <NavButton active={view === "home"} label="홈" onClick={() => setView("home")}><Home size={22}/></NavButton>
@@ -355,7 +414,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (data: AppData, sess
         const remoteData = parseCsv(remoteUnlocked.csv);
         const merged = localData ? mergeAppData(localData, remoteData) : remoteData;
         const pending = Boolean(local?.pendingSync) || localNeedsReencrypt || remoteUnlocked.needsReencrypt || !sameAppData(merged, remoteData);
-        const key = remoteUnlocked.needsReencrypt ? remoteUnlocked.key : remoteUnlocked.key;
+        const key = remoteUnlocked.key;
         const salt = remoteUnlocked.salt;
         const revision = Number(result.revision ?? 1);
         const vault = await encryptCsvWithKey(serializeCsv(merged), key, salt);
@@ -363,10 +422,9 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (data: AppData, sess
         onAuthenticated(merged, { username: user, verifier, verifierHash, key, salt, serverRevision: revision }, pending);
       } catch (onlineError) {
         if (!localData || !localKey) throw onlineError;
-        const pending = true;
         const vault = await encryptCsvWithKey(serializeCsv(localData), localKey, localSalt);
         await saveLocal({ username: user, verifierHash, vault, serverRevision: local?.serverRevision ?? 0, localModifiedAt: Date.now(), pendingSync: true });
-        onAuthenticated(localData, { username: user, verifier, verifierHash, key: localKey, salt: localSalt, serverRevision: local?.serverRevision ?? 0 }, pending);
+        onAuthenticated(localData, { username: user, verifier, verifierHash, key: localKey, salt: localSalt, serverRevision: local?.serverRevision ?? 0 }, true);
       }
     } catch (errorValue) {
       setError(errorValue instanceof Error ? errorValue.message : "로그인할 수 없습니다.");
@@ -379,7 +437,10 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (data: AppData, sess
     <div className="logo"><Utensils size={26}/></div>
     <h1>Food Coster</h1>
     <p>식대만 빠르게 기록하세요.</p>
-    <div className="segmented"><button className={mode === "login" ? "active" : ""} onClick={() => setMode("login")}>로그인</button><button className={mode === "register" ? "active" : ""} onClick={() => setMode("register")}>처음 시작</button></div>
+    <div className="segmented">
+      <button className={mode === "login" ? "active" : ""} onClick={() => setMode("login")}>로그인</button>
+      <button className={mode === "register" ? "active" : ""} onClick={() => setMode("register")}>처음 시작</button>
+    </div>
     <label className="field"><span>사용자명</span><input value={username} autoCapitalize="none" autoCorrect="off" onChange={(event) => setUsername(event.target.value)} placeholder="username" /></label>
     <label className="field"><span>암호</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="8자 이상" onKeyDown={(event) => { if (event.key === "Enter") void submit(); }} /></label>
     {error && <div className="error">{error}</div>}
@@ -388,8 +449,8 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (data: AppData, sess
 }
 
 function HomeView({ data, today, mutate }: { data: AppData; today: string; mutate: (fn: (data: AppData) => AppData) => void }) {
+  const summary = useMemo(() => periodSummary(data, fromDateKey(today)), [data, today]);
   const target = fromDateKey(today);
-  const summary = useMemo(() => periodSummary(data, target), [data, today]);
   return <div className="stack">
     <section className="hero-card">
       <span>지금 사용 가능</span><strong>{money(summary.availableNow)}</strong>
@@ -411,13 +472,19 @@ function CalendarView({ data, today, mutate }: { data: AppData; today: string; m
     const first = new Date(month.getFullYear(), month.getMonth(), 1);
     const start = new Date(first);
     start.setDate(1 - first.getDay());
-    return Array.from({ length: 42 }, (_, index) => { const date = new Date(start); date.setDate(start.getDate() + index); return date; });
+    return Array.from({ length: 42 }, (_, index) => {
+      const date = new Date(start);
+      date.setDate(start.getDate() + index);
+      return date;
+    });
   }, [month]);
+
   const move = (offset: number) => {
     const next = new Date(month.getFullYear(), month.getMonth() + offset, 1);
     setMonth(next);
     setSelected(dateKey(new Date(next.getFullYear(), next.getMonth(), 1)));
   };
+
   return <div className="stack">
     <section className="calendar-card">
       <div className="calendar-head"><button className="icon-btn" onClick={() => move(-1)}><ChevronLeft/></button><h2>{month.getFullYear()}년 {month.getMonth() + 1}월</h2><button className="icon-btn" onClick={() => move(1)}><ChevronRight/></button></div>
@@ -441,12 +508,23 @@ function DayEditor({ date, data, mutate }: { date: string; data: AppData; mutate
   const allowance = mealAllowance(data, target);
   const work = allowance.workday;
   const dinnerOn = dinnerEligible(target, data);
-  const update = (patch: Partial<MealEntry>) => mutate((previous) => ({ ...previous, entries: { ...previous.entries, [date]: { ...(previous.entries[date] ?? { date, lunch: 0, dinner: 0, updatedAt: 0 }), ...patch, updatedAt: Date.now() } } }));
+  const update = (patch: Partial<MealEntry>) => mutate((previous) => ({
+    ...previous,
+    entries: {
+      ...previous.entries,
+      [date]: {
+        ...(previous.entries[date] ?? { date, lunch: 0, dinner: 0, updatedAt: 0 }),
+        ...patch,
+        updatedAt: Date.now(),
+      },
+    },
+  }));
+
   return <>
     <div className="meal-card">
-      <MealRow title="점심" budget={allowance.lunch} value={entry.lunch} disabled={!work} onChange={(value) => update({ lunch: value })}/>
+      <MealRow title="점심" budget={allowance.lunch} value={entry.lunch} inactive={!work} onChange={(value) => update({ lunch: value })}/>
       <div className="divider"/>
-      <MealRow title="저녁" budget={allowance.dinner} value={entry.dinner} disabled={!dinnerOn} onChange={(value) => update({ dinner: value })}/>
+      <MealRow title="저녁" budget={allowance.dinner} value={entry.dinner} inactive={!dinnerOn} onChange={(value) => update({ dinner: value })}/>
       <div className="day-options">
         {allowance.rule.dinnerPolicy === "CONDITIONAL" && work && <button className={`chip ${entry.dinnerEligible ? "on" : ""}`} onClick={() => update({ dinnerEligible: !entry.dinnerEligible })}>{entry.dinnerEligible ? "저녁 제공" : "저녁 미제공"}</button>}
         <button className={`chip ${entry.dayOverride ? "on" : ""}`} onClick={() => setDaySheet(true)}>{entry.dayOverride === "ON" ? "식대 제공" : entry.dayOverride === "OFF" ? "식대 제외" : "기본 일정"}</button>
@@ -460,9 +538,16 @@ function DayEditor({ date, data, mutate }: { date: string; data: AppData; mutate
   </>;
 }
 
-function MealRow({ title, budget, value, disabled, onChange }: { title: string; budget: number; value: number; disabled: boolean; onChange: (value: number) => void }) {
+function MealRow({ title, budget, value, inactive, onChange }: { title: string; budget: number; value: number; inactive: boolean; onChange: (value: number) => void }) {
   const remain = Math.max(0, budget - value);
-  return <div className={`meal-row ${disabled ? "disabled" : ""}`}><div><strong>{title}</strong><span>{disabled ? "대상 아님" : `${money(budget)} · ${money(remain)} 남음`}</span></div><div className="meal-input-wrap"><button className="fill-btn" disabled={disabled} onClick={() => onChange(budget)}>전액</button><div className="money-input"><input inputMode="numeric" disabled={disabled} value={value ? String(value) : ""} placeholder="0" onChange={(event) => onChange(Math.max(0, Number(event.target.value.replace(/\D/g, "")) || 0))}/><span>원</span></div></div></div>;
+  const editableExisting = inactive && value > 0;
+  return <div className={`meal-row ${inactive ? "disabled" : ""}`}>
+    <div><strong>{title}</strong><span>{inactive ? editableExisting ? "대상 아님 · 기존 기록 수정 가능" : "대상 아님" : `${money(budget)} · ${money(remain)} 남음`}</span></div>
+    <div className="meal-input-wrap">
+      <button className="fill-btn" disabled={inactive} onClick={() => onChange(budget)}>전액</button>
+      <div className="money-input"><input inputMode="numeric" disabled={inactive && !editableExisting} value={value ? String(value) : ""} placeholder="0" onChange={(event) => onChange(Math.max(0, Number(event.target.value.replace(/\D/g, "")) || 0))}/><span>원</span></div>
+    </div>
+  </div>;
 }
 
 function SettingsView({ data, session, mutate, installable, onInstall, onExport, onImport, onChangePassword, onDelete, onLogout }: {
@@ -472,7 +557,7 @@ function SettingsView({ data, session, mutate, installable, onInstall, onExport,
   installable: boolean;
   onInstall: () => Promise<void>;
   onExport: () => Promise<void>;
-  onImport: (file: File) => Promise<void>;
+  onImport: (file: File, password: string) => Promise<void>;
   onChangePassword: (password: string) => Promise<void>;
   onDelete: () => Promise<void>;
   onLogout: () => void;
@@ -481,10 +566,13 @@ function SettingsView({ data, session, mutate, installable, onInstall, onExport,
   const [picker, setPicker] = useState<{ title: string; value: string; options: [string, string][]; apply: (value: string) => void } | null>(null);
   const [passwordOpen, setPasswordOpen] = useState(false);
   const [newPassword, setNewPassword] = useState("");
+  const [backupFile, setBackupFile] = useState<File | null>(null);
+  const [backupPassword, setBackupPassword] = useState("");
   const [dangerOpen, setDangerOpen] = useState(false);
   const [dangerText, setDangerText] = useState("");
   const [status, setStatus] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
+
   const active = rulesForDate(data, new Date());
   const range = cycleRangeForDate(data, new Date());
   const effectiveFrom = applyFrom === "current" ? dateKey(range.start) : dateKey(nextCycleStart(data));
@@ -526,7 +614,7 @@ function SettingsView({ data, session, mutate, installable, onInstall, onExport,
       {installable && <ActionSetting icon={<Smartphone size={18}/>} label="앱 설치" onClick={() => void onInstall()}/>} 
       <ActionSetting icon={<Download size={18}/>} label="암호화 백업 내보내기" onClick={() => void onExport()}/>
       <ActionSetting icon={<Upload size={18}/>} label="암호화 백업 가져오기" onClick={() => fileRef.current?.click()}/>
-      <input ref={fileRef} hidden type="file" accept=".enc,application/octet-stream" onChange={(event) => { const file = event.target.files?.[0]; if (file) void run(() => onImport(file), "복원했습니다."); event.currentTarget.value = ""; }}/>
+      <input ref={fileRef} hidden type="file" accept=".enc,application/octet-stream" onChange={(event) => { const file = event.target.files?.[0]; if (file) { setBackupFile(file); setBackupPassword(""); } event.currentTarget.value = ""; }}/>
       <ActionSetting label="암호 변경" onClick={() => setPasswordOpen(true)}/>
     </SettingsGroup>
     {status && <div className="notice">{status}</div>}
@@ -535,6 +623,7 @@ function SettingsView({ data, session, mutate, installable, onInstall, onExport,
 
     {picker && <Sheet title={picker.title} onClose={() => setPicker(null)}>{picker.options.map(([value, label]) => <SheetChoice key={value} label={label} selected={picker.value === value} onClick={() => { picker.apply(value); setPicker(null); }}/>)}</Sheet>}
     {passwordOpen && <Sheet title="암호 변경" onClose={() => { setPasswordOpen(false); setNewPassword(""); }}><label className="field sheet-field"><span>새 암호</span><input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} placeholder="8자 이상" /></label><button className="primary" onClick={() => void run(async () => { await onChangePassword(newPassword); setPasswordOpen(false); setNewPassword(""); }, "암호를 변경했습니다.")}>변경</button></Sheet>}
+    {backupFile && <Sheet title="백업 복원" onClose={() => { setBackupFile(null); setBackupPassword(""); }}><p className="sheet-copy">백업을 만들 때 사용한 암호를 입력하세요.</p><label className="field sheet-field"><span>백업 암호</span><input type="password" value={backupPassword} onChange={(event) => setBackupPassword(event.target.value)} placeholder="8자 이상" /></label><button className="primary" disabled={backupPassword.length < 8} onClick={() => void run(async () => { await onImport(backupFile, backupPassword); setBackupFile(null); setBackupPassword(""); }, "복원했습니다.")}>복원</button></Sheet>}
     {dangerOpen && <Sheet title="계정 삭제" onClose={() => { setDangerOpen(false); setDangerText(""); }}><p className="sheet-copy">삭제하려면 <strong>{session.username}</strong> 입력</p><label className="field sheet-field"><input value={dangerText} onChange={(event) => setDangerText(event.target.value)} /></label><button className="danger-button" disabled={dangerText !== session.username} onClick={() => void onDelete()}>영구 삭제</button></Sheet>}
   </div>;
 }
@@ -551,4 +640,7 @@ function labelOf(value: string, options: [string, string][]) { return options.fi
 function Sheet({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
   return <div className="sheet-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><div className="sheet"><div className="sheet-head"><strong>{title}</strong><button className="icon-btn" onClick={onClose}><X size={20}/></button></div>{children}</div></div>;
 }
-function SheetChoice({ label, selected, onClick }: { label: string; selected: boolean; onClick: () => void }) { return <button className="sheet-choice" onClick={onClick}><span>{label}</span>{selected && <Check size={19}/>}</button>; }
+
+function SheetChoice({ label, selected, onClick }: { label: string; selected: boolean; onClick: () => void }) {
+  return <button className="sheet-choice" onClick={onClick}><span>{label}</span>{selected && <Check size={19}/>}</button>;
+}
