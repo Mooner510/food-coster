@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: write
+
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -16,7 +19,27 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: pnpm install --no-frozen-lockfile
+      - id: lock
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo "missing=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+          fi
+      - run: |
+          if [ -f pnpm-lock.yaml ]; then
+            pnpm install --frozen-lockfile
+          else
+            pnpm install --no-frozen-lockfile
+          fi
+      - name: Persist generated lockfile
+        if: steps.lock.outputs.missing == 'true' && github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pnpm-lock.yaml
+          git commit -m "chore: add pnpm lockfile"
+          git push
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
@@ -24,9 +47,3 @@ jobs:
         env:
           TURSO_DATABASE_URL: https://example.invalid
           TURSO_AUTH_TOKEN: ci-placeholder
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: pnpm-lock
-          path: pnpm-lock.yaml
-          if-no-files-found: ignore
