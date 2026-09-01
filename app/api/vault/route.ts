@@ -41,6 +41,17 @@ async function clearRateLimit(key: string) {
   await execute("DELETE FROM food_coster_rate_limits WHERE rate_key = ?", [key]).catch(() => undefined);
 }
 
+async function conflict(username: string) {
+  const latest = await user(username);
+  return NextResponse.json({
+    error: "다른 기기에서 더 최신 데이터가 저장되었습니다.",
+    conflict: true,
+    vault: latest?.vault,
+    revision: Number(latest?.revision ?? 1),
+    updatedAt: latest?.updated_at,
+  }, { status: 409 });
+}
+
 export async function POST(request: Request) {
   try {
     await ensureSchema();
@@ -81,20 +92,22 @@ export async function POST(request: Request) {
     if (action === "push") {
       if (!validVault(body.vault)) return NextResponse.json({ error: "저장 데이터가 올바르지 않습니다." }, { status: 400 });
       const baseRevision = Math.max(0, Number(body.baseRevision ?? 0));
-      if (baseRevision !== revision) return NextResponse.json({ error: "다른 기기에서 더 최신 데이터가 저장되었습니다.", conflict: true, vault: existing.vault, revision, updatedAt: existing.updated_at }, { status: 409 });
+      if (baseRevision !== revision) return conflict(username);
       const now = Date.now();
       const nextRevision = revision + 1;
-      await execute("UPDATE food_coster_users SET vault = ?, revision = ?, updated_at = ? WHERE username = ? AND revision = ?", [body.vault, nextRevision, now, username, revision]);
+      const result = await execute("UPDATE food_coster_users SET vault = ?, revision = ?, updated_at = ? WHERE username = ? AND revision = ?", [body.vault, nextRevision, now, username, revision]);
+      if (result.affected_row_count !== 1) return conflict(username);
       return NextResponse.json({ vault: body.vault, revision: nextRevision, updatedAt: now });
     }
 
     if (action === "change_credentials") {
       if (!validVerifier(body.newVerifier) || !validVault(body.vault)) return NextResponse.json({ error: "새 인증 정보가 올바르지 않습니다." }, { status: 400 });
       const baseRevision = Math.max(0, Number(body.baseRevision ?? 0));
-      if (baseRevision !== revision) return NextResponse.json({ error: "다른 기기에서 더 최신 데이터가 저장되었습니다.", conflict: true, vault: existing.vault, revision, updatedAt: existing.updated_at }, { status: 409 });
+      if (baseRevision !== revision) return conflict(username);
       const now = Date.now();
       const nextRevision = revision + 1;
-      await execute("UPDATE food_coster_users SET verifier_hash = ?, vault = ?, revision = ?, updated_at = ? WHERE username = ? AND revision = ?", [hash(body.newVerifier), body.vault, nextRevision, now, username, revision]);
+      const result = await execute("UPDATE food_coster_users SET verifier_hash = ?, vault = ?, revision = ?, updated_at = ? WHERE username = ? AND revision = ?", [hash(body.newVerifier), body.vault, nextRevision, now, username, revision]);
+      if (result.affected_row_count !== 1) return conflict(username);
       return NextResponse.json({ revision: nextRevision, updatedAt: now });
     }
 
