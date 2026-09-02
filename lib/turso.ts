@@ -56,6 +56,17 @@ export function ensureSchema() {
       )`);
       const columns = rows(await execute("PRAGMA table_info(food_coster_users)"));
       if (!columns.some((column) => column.name === "revision")) await execute("ALTER TABLE food_coster_users ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+
+      await execute(`CREATE TABLE IF NOT EXISTS food_coster_sessions (
+        token_hash TEXT PRIMARY KEY NOT NULL,
+        username TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      )`);
+      await execute("CREATE INDEX IF NOT EXISTS idx_food_coster_sessions_username ON food_coster_sessions(username)");
+      await execute("CREATE INDEX IF NOT EXISTS idx_food_coster_sessions_expires_at ON food_coster_sessions(expires_at)");
+
       await execute(`CREATE TABLE IF NOT EXISTS food_coster_rate_limits (
         rate_key TEXT PRIMARY KEY NOT NULL,
         attempts INTEGER NOT NULL,
