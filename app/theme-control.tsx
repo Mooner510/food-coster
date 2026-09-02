@@ -34,8 +34,9 @@ export default function ThemeControl() {
   useEffect(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
     const initial: ThemePreference = stored === "light" || stored === "dark" ? stored : "system";
-    setPreference(initial);
     applyTheme(initial);
+    const frame = requestAnimationFrame(() => setPreference(initial));
+    return () => cancelAnimationFrame(frame);
   }, []);
 
   useEffect(() => {
