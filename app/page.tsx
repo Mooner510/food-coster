@@ -45,14 +45,13 @@ import {
   type MealEntry,
   type Ruleset,
 } from "@/lib/model";
-import { deleteLocal, loadLocal, saveLocal } from "@/lib/storage";
+import { deleteLocal, forgetLocalKey, loadLocal, loadRememberedLocal, saveLocal } from "@/lib/storage";
 import { mergeAppData, sameAppData } from "@/lib/sync";
 
 type View = "home" | "calendar" | "settings";
 type SyncState = "saved" | "saving" | "offline" | "conflict";
 type Session = {
   username: string;
-  verifier: string;
   verifierHash: string;
   key: VaultKey;
   salt: string;
@@ -65,6 +64,7 @@ type ApiResult = {
   updatedAt?: number;
   conflict?: boolean;
   deleted?: boolean;
+  loggedOut?: boolean;
 };
 type InstallPromptEvent = Event & {
   prompt: () => Promise<void>;
@@ -78,6 +78,7 @@ const nowKey = () => dateKey(new Date());
 async function api(body: Record<string, unknown>) {
   const response = await fetch("/api/vault", {
     method: "POST",
+    credentials: "same-origin",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
@@ -89,6 +90,7 @@ async function api(body: Record<string, unknown>) {
 export default function Page() {
   const [data, setData] = useState<AppData>(() => defaultData());
   const [session, setSession] = useState<Session | null>(null);
+  const [booting, setBooting] = useState(true);
   const [view, setView] = useState<View>("home");
   const [syncState, setSyncState] = useState<SyncState>("saved");
   const [today, setToday] = useState(nowKey());
@@ -129,6 +131,10 @@ export default function Page() {
         serverRevision: current.serverRevision,
         localModifiedAt,
         pendingSync: pending,
+        vaultKey: current.key,
+        salt: current.salt,
+        remembered: true,
+        lastUsedAt: Date.now(),
       });
     }).catch(() => undefined);
     return saveChain.current;
@@ -151,7 +157,7 @@ export default function Page() {
     setSyncState("saving");
     try {
       if (!pendingSync.current) {
-        const remote = await api({ action: "pull", username: current.username, verifier: current.verifier });
+        const remote = await api({ action: "pull" });
         const remoteRevision = Math.max(1, Number(remote.revision ?? 1));
         if (remoteRevision > current.serverRevision && remote.vault) {
           const remoteData = await decryptRemote(remote.vault, current);
@@ -171,8 +177,6 @@ export default function Page() {
       try {
         const pushed = await api({
           action: "push",
-          username: current.username,
-          verifier: current.verifier,
           vault: JSON.stringify(vault),
           baseRevision: current.serverRevision,
         });
@@ -198,8 +202,6 @@ export default function Page() {
         const mergedVault = await encryptCsvWithKey(serializeCsv(merged), current.key, current.salt);
         const retry = await api({
           action: "push",
-          username: current.username,
-          verifier: current.verifier,
           vault: JSON.stringify(mergedVault),
           baseRevision: remoteRevision,
         });
@@ -210,7 +212,18 @@ export default function Page() {
         await writeLocal(merged, next, false);
         setSyncState("saved");
       }
-    } catch {
+    } catch (error) {
+      const status = (error as Error & { status?: number }).status;
+      if (status === 401) {
+        await forgetLocalKey(current.username).catch(() => undefined);
+        sessionRef.current = null;
+        pendingSync.current = false;
+        setSession(null);
+        setData(defaultData());
+        setView("home");
+        setSyncState("saved");
+        return;
+      }
       setSyncState(navigator.onLine ? "conflict" : "offline");
     } finally {
       syncing.current = false;
@@ -219,7 +232,7 @@ export default function Page() {
 
   const scheduleSync = useCallback(() => {
     if (syncTimer.current) clearTimeout(syncTimer.current);
-    syncTimer.current = setTimeout(() => void synchronize(), 700);
+    syncTimer.current = setTimeout(() => void synchronize(), 1_000);
   }, [synchronize]);
 
   const mutate = useCallback((updater: (previous: AppData) => AppData) => {
@@ -255,7 +268,39 @@ export default function Page() {
     if (pending) setTimeout(() => void synchronize(), 0);
   }, [synchronize]);
 
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const local = await loadRememberedLocal();
+        if (!local?.vaultKey || !local.salt) return;
+        const localData = parseCsv(await decryptCsvWithKey(local.vault, local.vaultKey));
+        if (cancelled) return;
+        const nextSession: Session = {
+          username: local.username,
+          verifierHash: local.verifierHash,
+          key: local.vaultKey,
+          salt: local.salt,
+          serverRevision: local.serverRevision,
+        };
+        authenticated(localData, nextSession, local.pendingSync);
+        if (!local.pendingSync) setTimeout(() => void synchronize(), 0);
+        if (navigator.storage?.persist) void navigator.storage.persist().catch(() => false);
+      } catch {
+        // A corrupted or unsupported remembered key falls back to normal login.
+      } finally {
+        if (!cancelled) setBooting(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [authenticated, synchronize]);
+
   const logout = useCallback(() => {
+    const current = sessionRef.current;
+    if (current) {
+      void api({ action: "logout" }).catch(() => undefined);
+      void forgetLocalKey(current.username).catch(() => undefined);
+    }
     sessionRef.current = null;
     pendingSync.current = false;
     setSession(null);
@@ -298,15 +343,12 @@ export default function Page() {
     const vault = await encryptCsvWithKey(serializeCsv(dataRef.current), key, salt);
     const result = await api({
       action: "change_credentials",
-      username: fresh.username,
-      verifier: fresh.verifier,
       newVerifier,
       vault: JSON.stringify(vault),
       baseRevision: fresh.serverRevision,
     });
     const next: Session = {
       username: fresh.username,
-      verifier: newVerifier,
       verifierHash: newVerifierHash,
       key,
       salt,
@@ -320,10 +362,14 @@ export default function Page() {
   const deleteAccount = useCallback(async () => {
     const current = sessionRef.current;
     if (!current) return;
-    await api({ action: "delete", username: current.username, verifier: current.verifier });
+    await api({ action: "delete" });
     await deleteLocal(current.username);
-    logout();
-  }, [logout]);
+    sessionRef.current = null;
+    pendingSync.current = false;
+    setSession(null);
+    setData(defaultData());
+    setView("home");
+  }, []);
 
   const install = useCallback(async () => {
     if (!installPrompt) return;
@@ -332,6 +378,7 @@ export default function Page() {
     setInstallPrompt(null);
   }, [installPrompt]);
 
+  if (booting) return <main className="auth-wrap"><section className="auth-card"><div className="logo"><Utensils size={26}/></div><h1>Food Coster</h1><p>기록을 불러오는 중...</p></section></main>;
   if (!session) return <AuthScreen onAuthenticated={authenticated} />;
 
   return (
@@ -388,8 +435,20 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (data: AppData, sess
         const created = await makeInitialVault(serializeCsv(initial), password);
         const result = await api({ action: "register", username: user, verifier, vault: JSON.stringify(created.vault) });
         const revision = Number(result.revision ?? 1);
-        await saveLocal({ username: user, verifierHash, vault: created.vault, serverRevision: revision, localModifiedAt: Date.now(), pendingSync: false });
-        onAuthenticated(initial, { username: user, verifier, verifierHash, key: created.key, salt: created.salt, serverRevision: revision }, false);
+        await saveLocal({
+          username: user,
+          verifierHash,
+          vault: created.vault,
+          serverRevision: revision,
+          localModifiedAt: Date.now(),
+          pendingSync: false,
+          vaultKey: created.key,
+          salt: created.salt,
+          remembered: true,
+          lastUsedAt: Date.now(),
+        });
+        if (navigator.storage?.persist) void navigator.storage.persist().catch(() => false);
+        onAuthenticated(initial, { username: user, verifierHash, key: created.key, salt: created.salt, serverRevision: revision }, false);
         return;
       }
 
@@ -418,13 +477,37 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (data: AppData, sess
         const salt = remoteUnlocked.salt;
         const revision = Number(result.revision ?? 1);
         const vault = await encryptCsvWithKey(serializeCsv(merged), key, salt);
-        await saveLocal({ username: user, verifierHash, vault, serverRevision: revision, localModifiedAt: Date.now(), pendingSync: pending });
-        onAuthenticated(merged, { username: user, verifier, verifierHash, key, salt, serverRevision: revision }, pending);
+        await saveLocal({
+          username: user,
+          verifierHash,
+          vault,
+          serverRevision: revision,
+          localModifiedAt: Date.now(),
+          pendingSync: pending,
+          vaultKey: key,
+          salt,
+          remembered: true,
+          lastUsedAt: Date.now(),
+        });
+        if (navigator.storage?.persist) void navigator.storage.persist().catch(() => false);
+        onAuthenticated(merged, { username: user, verifierHash, key, salt, serverRevision: revision }, pending);
       } catch (onlineError) {
         if (!localData || !localKey) throw onlineError;
         const vault = await encryptCsvWithKey(serializeCsv(localData), localKey, localSalt);
-        await saveLocal({ username: user, verifierHash, vault, serverRevision: local?.serverRevision ?? 0, localModifiedAt: Date.now(), pendingSync: true });
-        onAuthenticated(localData, { username: user, verifier, verifierHash, key: localKey, salt: localSalt, serverRevision: local?.serverRevision ?? 0 }, true);
+        await saveLocal({
+          username: user,
+          verifierHash,
+          vault,
+          serverRevision: local?.serverRevision ?? 0,
+          localModifiedAt: Date.now(),
+          pendingSync: true,
+          vaultKey: localKey,
+          salt: localSalt,
+          remembered: true,
+          lastUsedAt: Date.now(),
+        });
+        if (navigator.storage?.persist) void navigator.storage.persist().catch(() => false);
+        onAuthenticated(localData, { username: user, verifierHash, key: localKey, salt: localSalt, serverRevision: local?.serverRevision ?? 0 }, true);
       }
     } catch (errorValue) {
       setError(errorValue instanceof Error ? errorValue.message : "로그인할 수 없습니다.");
