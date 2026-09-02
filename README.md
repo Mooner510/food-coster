@@ -2,6 +2,8 @@
 
 점심·저녁 식대를 기록하고, 정산 기간별 사용액과 현재 사용할 수 있는 식대를 계산하는 모바일 우선 PWA입니다.
 
+**웹사이트:** https://food-coster.mooner510.kr
+
 서버는 식대 계산을 하지 않습니다. 식대 규칙, 정산 계산, CSV 변환, 암복호화는 모두 클라이언트에서 수행하며 서버에는 암호화된 vault만 저장합니다.
 
 ## 주요 기능
@@ -190,6 +192,8 @@ CI build에서는 실제 Turso에 연결하지 않고 placeholder 환경 변수�
 ```
 
 즉 feature branch를 push해도 GitHub Actions CI는 실행되지만 **Vercel Preview Deployment는 생성하지 않습니다.**
+
+운영 웹사이트는 `https://food-coster.mooner510.kr`입니다.
 
 ---
 
