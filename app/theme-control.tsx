@@ -8,7 +8,7 @@ type ThemePreference = "system" | "light" | "dark";
 const STORAGE_KEY = "food-coster-theme";
 const OPTIONS: { value: ThemePreference; label: string; icon: typeof Monitor }[] = [
   { value: "system", label: "시스템", icon: Monitor },
-  { value: "light", label: "라이트", icon: Sun },
+  { value: "light", label: "화이트", icon: Sun },
   { value: "dark", label: "다크", icon: Moon },
 ];
 
